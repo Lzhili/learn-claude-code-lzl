@@ -27,6 +27,8 @@ Agent 崩溃了。它没有重试，没有换模型，没有减少上下文—�
 
 ![Error Recovery Overview](images/error-recovery-overview.svg)
 
+补充：HTTP 413 (Payload Too Large / 请求实体过大)，HTTP 429 (Too Many Requests / 请求过多)，529 (Overloaded / 服务过载)
+
 s10 的循环、prompt 组装全部保留。唯一的变动：LLM 调用包裹在 try/except 里，根据错误类型走不同的恢复路径。恢复后 `continue` 回到循环开头重新调用 LLM。
 
 三种最常见的恢复模式（教学版只处理 429/529；真实系统还覆盖连接错误、超时、云厂商认证缓存等。CC 实际有 13+ reason code，其余见 Deep dive）：
