@@ -145,13 +145,13 @@ for block in response.content:
         results.append({"type": "tool_result",
             "tool_use_id": block.id, "content": output})
 
-# 通知和工具结果合入同一条 user 消息
-user_content = []
+# 工具结果和通知合入同一条 user 消息
+user_content = list(results)
 bg_notifications = collect_background_results()
 if bg_notifications:
     for notif in bg_notifications:
         user_content.append({"type": "text", "text": notif})
-user_content.extend(results)
+
 messages.append({"role": "user", "content": user_content})
 ```
 
