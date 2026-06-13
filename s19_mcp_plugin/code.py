@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
 """
-s19: MCP Tools — MCPClient + tool discovery + assemble_tool_pool.
+s19: MCP Tools — MCPClient + 工具发现 + 工具池动态组装。
 
-Run:  python s19_mcp_plugin/code.py
+AI 编程智能体的插件系统：
+1. MCPClient 类：发现工具、通过 mock handler 调用工具
+2. normalize_mcp_name: 标准化工具/服务名（替换非法字符为下划线）
+3. assemble_tool_pool: 将内置工具 + MCP 工具动态组装为统一工具池
+4. connect_mcp: 连接 MCP 服务器，发现工具并注册到全局客户端表
+5. Tool naming: mcp__{server}__{tool} 前缀命名空间（标准化后）
+6. MCP 工具标注 readOnly/destructive（用于权限判断）
+7. agent_loop 使用动态工具池（内置 + MCP），无 prompt 缓存
+
+核心洞察：s18 之前，Agent 的能力受限于我们给它写的工具——bash、read、write、task...
+但如果用户已经有了自己的工具怎么办？比如公司内部的 Jira API、自建的部署系统？
+s19 让 Agent 可以连接外部 MCP 服务器，自动发现其工具并集成到工具池中。
+Agent 不需要知道工具是谁写的——通过 mcp__ 前缀自动将外部工具注入到
+同一个 dispatch 机制中。这是从"固定工具集"到"可扩展插件体系"的跃迁。
+
+数据流：
+  connect_mcp("docs") → MCPClient discovers tools →
+  assemble_tool_pool → [builtin... , mcp__docs__search, mcp__docs__get_version]
+  agent_loop uses assembled pool
+
+Run / 运行: python s19_mcp_plugin/code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
-Changes from s18:
+Changes from s18 / 相对 s18 的变更:
   - MCPClient class: discovers tools, calls tools via mock handler
   - normalize_mcp_name: normalize tool/server names
   - assemble_tool_pool: assembles builtin + MCP tools into one pool
@@ -14,11 +34,6 @@ Changes from s18:
   - MCP tools have readOnly/destructive annotations
   - agent_loop uses dynamic tool pool (builtin + MCP), no prompt cache
   - Teammate tools: complete_task, worktree cwd (from s17/s18 fixes)
-
-ASCII flow:
-  connect_mcp("docs") → MCPClient discovers tools →
-  assemble_tool_pool → [builtin... , mcp__docs__search, mcp__docs__get_version]
-  agent_loop uses assembled pool
 """
 
 import os, subprocess, json, time, random, threading, re
@@ -26,24 +41,31 @@ from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
 
+# ── 终端中文输入兼容性 ──────────────────────────────────
 try:
     import readline
     readline.parse_and_bind('set bind-tty-special-chars off')
+    readline.parse_and_bind('set input-meta on')
+    readline.parse_and_bind('set output-meta on')
+    readline.parse_and_bind('set convert-meta off')
 except ImportError:
     pass
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# ── 初始化 Anthropic 客户端 ────────────────────────────
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-WORKDIR = Path.cwd()
+WORKDIR = Path.cwd()  # 工作目录
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System ──
+# ═══════════════════════════════════════════════════════════
+#  FROM s12 + s18: 任务系统 + Worktree 系统
+# ═══════════════════════════════════════════════════════════
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -243,7 +265,9 @@ def keep_worktree(name: str) -> str:
     return f"Worktree '{name}' kept for review (branch: wt/{name})"
 
 
-# ── Prompt Assembly ──
+# ═══════════════════════════════════════════════════════════
+#  FROM s10 + s19: Prompt 组装（含 MCP 服务器列表）
+# ═══════════════════════════════════════════════════════════
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -252,27 +276,28 @@ PROMPT_SECTIONS = {
              "spawn_teammate, send_message, check_inbox, "
              "request_shutdown, request_plan, review_plan, "
              "create_worktree, remove_worktree, keep_worktree, "
-             "connect_mcp. MCP tools are prefixed mcp__{server}__{tool}.",
+             "connect_mcp. MCP tools are prefixed mcp__{server}__{tool}.", # s19 MCP 工具命名规范
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
 }
 
 
 def assemble_system_prompt(context: dict) -> str:
+    """组装 system prompt。s19 新增：MCP 服务器列表注入。"""
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
     if context.get("memories"):
         sections.append(f"Relevant memories:\n{context['memories']}")
-    mcp_names = list(mcp_clients.keys())
+    mcp_names = list(mcp_clients.keys())  # s19: 动态注入已连接 MCP 服务器信息
     if mcp_names:
         sections.append(f"Connected MCP servers: {', '.join(mcp_names)}")
     return "\n\n".join(sections)
 
 
-# ── Basic Tools ──
-
+# ── 基础工具实现（含 cwd 参数支持 worktree）─────────────
 def safe_path(p: str, cwd: Path = None) -> Path:
+    """路径安全校验。"""
     base = cwd or WORKDIR
     path = (base / p).resolve()
     if not path.is_relative_to(base):
@@ -281,6 +306,7 @@ def safe_path(p: str, cwd: Path = None) -> Path:
 
 
 def run_bash(command: str, cwd: Path = None) -> str:
+    """执行 shell 命令。"""
     try:
         r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -291,6 +317,7 @@ def run_bash(command: str, cwd: Path = None) -> str:
 
 
 def run_read(path: str, limit: int | None = None, cwd: Path = None) -> str:
+    """读取文件内容。"""
     try:
         lines = safe_path(path, cwd).read_text().splitlines()
         if limit and limit < len(lines):
@@ -301,6 +328,7 @@ def run_read(path: str, limit: int | None = None, cwd: Path = None) -> str:
 
 
 def run_write(path: str, content: str, cwd: Path = None) -> str:
+    """写入文件。"""
     try:
         fp = safe_path(path, cwd)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +338,9 @@ def run_write(path: str, content: str, cwd: Path = None) -> str:
         return f"Error: {e}"
 
 
-# ── MessageBus ──
+# ═══════════════════════════════════════════════════════════
+#  FROM s15/s16/s17/s18: MessageBus + Protocol + Autonomous + Teammate
+# ═══════════════════════════════════════════════════════════
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -655,22 +685,29 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'}"
 
 
-# ── MCP System (s19 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s19: MCP 系统（Model Context Protocol Plugin）
+#  MCPClient 模拟外部工具服务器 + connect_mcp 发现+注册
+#  assemble_tool_pool 动态组装内置+外部工具池
+# ═══════════════════════════════════════════════════════════
 
 class MCPClient:
-    """Discovers and calls tools on an MCP server (mock for teaching)."""
+    """MCP 客户端：发现并调用外部 MCP 服务器的工具（教学版 mock）。
+    真实 MCP 协议通过 JSON-RPC 通信，教学版用内存 handler 字典模拟。"""
 
     def __init__(self, name: str):
         self.name = name
-        self.tools: list[dict] = []
-        self._handlers: dict[str, callable] = {}
+        self.tools: list[dict] = []             # 工具定义列表（schema）
+        self._handlers: dict[str, callable] = {}  # 工具名 → handler 函数
 
     def register(self, tool_defs: list[dict],
                  handlers: dict[str, callable]):
+        """注册工具定义和对应的 handler 函数。"""
         self.tools = tool_defs
         self._handlers = handlers
 
     def call_tool(self, tool_name: str, args: dict) -> str:
+        """调用 MCP 工具：handler 查找 → 执行 → 错误处理。"""
         handler = self._handlers.get(tool_name)
         if not handler:
             return f"MCP error: unknown tool '{tool_name}'"
@@ -680,17 +717,19 @@ class MCPClient:
             return f"MCP error: {e}"
 
 
-mcp_clients: dict[str, MCPClient] = {}
+mcp_clients: dict[str, MCPClient] = {}  # 已连接的 MCP 服务器注册表
 
-_DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
+_DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')  # 非法字符正则
 
 
 def normalize_mcp_name(name: str) -> str:
-    """Replace non [a-zA-Z0-9_-] with underscore."""
+    """标准化 MCP 名称：将非法字符（非字母数字下划线横线）替换为下划线。
+    目的：保证 mcp__{server}__{tool} 前缀格式不含特殊字符。"""
     return _DISALLOWED_CHARS.sub('_', name)
 
 
 def _mock_server_docs():
+    """Mock MCP 服务器 "docs"：提供 search 和 get_version 两个工具。"""
     client = MCPClient("docs")
     client.register(
         tool_defs=[
@@ -710,6 +749,7 @@ def _mock_server_docs():
 
 
 def _mock_server_deploy():
+    """Mock MCP 服务器 "deploy"：提供 trigger（破坏性）和 status（只读）工具。"""
     client = MCPClient("deploy")
     client.register(
         tool_defs=[
@@ -730,41 +770,44 @@ def _mock_server_deploy():
     return client
 
 
-MOCK_SERVERS = {
+MOCK_SERVERS = {  # 可用 MCP 服务器注册表（教学版）
     "docs": _mock_server_docs,
     "deploy": _mock_server_deploy,
 }
 
 
 def connect_mcp(name: str) -> str:
+    """连接 MCP 服务器：查表 → 创建客户端 → 注册到 mcp_clients → 报告工具列表。"""
     if name in mcp_clients:
         return f"MCP server '{name}' already connected"
     factory = MOCK_SERVERS.get(name)
     if not factory:
         available = ", ".join(MOCK_SERVERS.keys())
         return f"Unknown server '{name}'. Available: {available}"
-    mcp_client = factory()
+    mcp_client = factory() # 创建 MCPClient 实例并注册工具
     mcp_clients[name] = mcp_client
     tool_names = [t["name"] for t in mcp_client.tools]
-    print(f"  \033[31m[mcp] connected: {name} → {tool_names}\033[0m")
+    print(f"  \033[31m[mcp] connected: {name} → {tool_names}\033[0m") # 红色日志输出
     return (f"Connected to MCP server '{name}'. "
             f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
 
 
 def assemble_tool_pool() -> tuple[list[dict], dict]:
-    """Assemble builtin tools + all MCP tools into one pool."""
-    tools = list(BUILTIN_TOOLS)
+    """动态组装工具池：内置工具 + 所有已连接 MCP 服务器的工具。
+    命名规则：mcp__{safe_server}__{safe_tool}，利用 __ 作为命名空间分隔符。"""
+    tools = list(BUILTIN_TOOLS)     # 从内置工具开始
     handlers = dict(BUILTIN_HANDLERS)
-    for server_name, mcp_client in mcp_clients.items():
+    for server_name, mcp_client in mcp_clients.items(): # 外层循环：遍历已连接的 MCP 服务器
         safe_server = normalize_mcp_name(server_name)
-        for tool_def in mcp_client.tools:
+        for tool_def in mcp_client.tools: # 内层循环：遍历每个 MCP 服务器的工具定义
             safe_tool = normalize_mcp_name(tool_def["name"])
-            prefixed = f"mcp__{safe_server}__{safe_tool}"
+            prefixed = f"mcp__{safe_server}__{safe_tool}"  # s19 命名空间
             tools.append({
                 "name": prefixed,
                 "description": tool_def.get("description", ""),
                 "input_schema": tool_def.get("inputSchema", {}),
             })
+            # 默认参数闭包技巧：c=mcp_client, t=tool_name 在定义时捕获值
             handlers[prefixed] = (
                 lambda *, c=mcp_client, t=tool_def["name"], **kw: c.call_tool(t, kw))
     return tools, handlers
@@ -830,12 +873,12 @@ def run_check_inbox() -> str:
         lines.append(f"  [{m['from']}]{tag} {m['content'][:200]}")
     return "\n".join(lines)
 
+# s19 新增：连接 MCP 服务器工具的 handler 实现（调用 connect_mcp 函数）
 def run_connect_mcp(name: str) -> str:
     return connect_mcp(name)
 
 
-# ── Tool Definitions ──
-
+# ── 工具定义（s19 新增 connect_mcp + MCP 动态注入）──
 BUILTIN_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
@@ -944,22 +987,59 @@ BUILTIN_HANDLERS = {
 }
 
 
-# ── Context ──
+# ═══════════════════════════════════════════════════════════
+#  FROM s10: Context 系统
+# ═══════════════════════════════════════════════════════════
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
 
 def update_context(context: dict, messages: list) -> dict:
+    """从真实文件系统状态推导 context。"""
     memories = ""
     if MEMORY_INDEX.exists():
         memories = MEMORY_INDEX.read_text()[:2000]
     return {"memories": memories}
 
 
-# ── Agent Loop (s19: dynamic tool pool, no prompt cache) ──
+# ═══════════════════════════════════════════════════════════
+#  agent_loop — s19 核心：动态工具池 + connect_mcp 后重组装
+#  无 prompt 缓存——因为 MCP 连接后工具列表会变化
+# ═══════════════════════════════════════════════════════════
+
+def _tool_input_summary(block) -> str:
+    """提取工具调用的关键参数摘要。"""
+    inputs = block.input
+    if block.name == "bash":
+        return inputs.get("command", "")
+    if block.name in ("create_task",):
+        return inputs.get("subject", "")
+    if block.name in ("get_task", "claim_task", "complete_task"):
+        return inputs.get("task_id", "")
+    if block.name in ("list_tasks", "check_inbox"):
+        return ""
+    if block.name == "spawn_teammate":
+        return f"{inputs.get('name', '')} ({inputs.get('role', '')})"
+    if block.name == "send_message":
+        return f"→ {inputs.get('to', '')}"
+    if block.name in ("request_shutdown", "request_plan"):
+        return f"→ {inputs.get('teammate', '')}"
+    if block.name == "review_plan":
+        return f"{inputs.get('request_id', '')} approve={inputs.get('approve', False)}"
+    if block.name in ("create_worktree", "remove_worktree", "keep_worktree"):
+        return f"{inputs.get('name', '')}"
+    if block.name == "connect_mcp":
+        return f"{inputs.get('name', '')}"
+    # MCP 工具：mcp__{server}__{tool}
+    if block.name.startswith("mcp__"):
+        return str(inputs)
+    return inputs.get("path", "")
+
 
 def agent_loop(messages: list, context: dict):
+    """智能体主循环。s19 关键变更：动态工具池（每次 connect_mcp 后重组装），
+    无 prompt 缓存（工具列表可能变化）。MCP 工具通过 handlers dispatch 调用。"""
     tools, handlers = assemble_tool_pool()
     system = assemble_system_prompt(context)
     while True:
@@ -980,14 +1060,17 @@ def agent_loop(messages: list, context: dict):
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"\033[36m> {block.name}\033[0m")
+            # 显示工具名和关键参数（黄色）
+            print(f"\033[33m$ {block.name}: {_tool_input_summary(block)}\033[0m")
             handler = handlers.get(block.name)
             output = handler(**block.input) if handler else "Unknown"
-            print(str(output)[:300])
+            # 工具结果：粗体品红标签 + 品红内容
+            print(f"\033[1;35m[{block.name} -> Tool Calling Result]\033[0m \033[35m{str(output)[:300]}\033[0m")
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
 
+        # s19：connect_mcp 后重新组装工具池 + 刷新 prompt
         if any(b.name == "connect_mcp" for b in response.content
                if b.type == "tool_use"):
             tools, handlers = assemble_tool_pool()
@@ -995,6 +1078,7 @@ def agent_loop(messages: list, context: dict):
             system = assemble_system_prompt(context)
 
 
+# ── 入口：交互式 REPL ──────────────────────────────────
 if __name__ == "__main__":
     print("s19: mcp tools")
     print("Enter a question, press Enter to send. Type q to quit.\n")
@@ -1010,10 +1094,12 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history, context)
         context = update_context(context, history)
+        # 打印模型最终文本回复（蓝色）
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
-                print(block.text)
+                print(f"\033[34m{block.text}\033[0m")
 
+        # 统一收件箱消费
         inbox = consume_lead_inbox(route_protocol=True)
         if inbox:
             inbox_text = "\n".join(
